@@ -1,0 +1,105 @@
+BetaScan
+========
+
+Asynchronous TCP port scanner with service detection and lightweight
+fingerprinting.
+
+Overview
+--------
+BetaScan supports IP addresses and domain names, resolves DNS automatically,
+and reports port state (open/closed/filtered) plus service and version details
+when available.
+
+Author
+------
+Mohamed Riadh (Beta)
+
+Features
+--------
+- Asynchronous TCP scanning with configurable concurrency
+- Port presets (top 20/50/100) or custom ranges
+- Service hints from well-known ports and banners
+- Optional TLS probing with version/cipher and certificate metadata
+- Table, JSON, or CSV output
+
+Requirements
+------------
+- Python 3.9+ (3.10+ recommended)
+- Standard library only (no external dependencies)
+
+Setup
+-----
+1) Install Python from https://www.python.org/downloads/
+2) Verify the interpreter:
+   - Windows: python --version
+   - Linux/macOS: python3 --version
+3) Run from the project directory:
+
+   python betascan.py <target> [options]
+
+Usage
+-----
+python betascan.py <target> [options]
+
+Examples
+--------
+Basic scan (default ports 1-1024):
+
+  python betascan.py example.com
+
+Custom port range:
+
+  python betascan.py example.com --ports 1-1024,8080
+
+Top ports preset (20/50/100):
+
+  python betascan.py example.com --top 100
+
+Show only open ports:
+
+  python betascan.py example.com --top 100 --open-only
+
+JSON output to file:
+
+  python betascan.py example.com --top 100 --format json --output scan.json
+
+CSV output to file:
+
+  python betascan.py example.com --top 50 --format csv --output scan.csv
+
+Options
+-------
+Option | Description | Default
+--- | --- | ---
+--ports <list> | Port list or ranges (e.g., 1-1024,8080) | 1-1024
+--top <N> | Use curated common ports list (20, 50, 100) | -
+--timeout <seconds> | Connection timeout | 1.5
+--read-timeout <seconds> | Read timeout for banners and probes | 1.0
+--workers <count> | Concurrent workers | 200
+--retries <count> | Retry attempts for timeouts | 2
+--backoff <seconds> | Delay between retries | 0.2
+--rate <per-sec> | Limit new connections per second (0 = unlimited) | 0
+--open-only | Show only open ports | false
+--fingerprint / --no-fingerprint | Enable or disable fingerprinting | enabled
+--tls / --no-tls | Enable or disable TLS probing | enabled
+--format <table|json|csv> | Output format | table
+--output <path> | Write output to file instead of stdout | -
+
+Output Formats
+--------------
+- table: human-readable ASCII table
+- json: structured report per target
+- csv: flat rows suitable for spreadsheets
+
+Exit Codes
+----------
+- 0: success
+- 2: invalid arguments or target resolution error
+- 130: interrupted by user (Ctrl+C)
+
+Notes
+-----
+- Higher timeouts and retries improve accuracy at the cost of scan time.
+- TLS probing includes protocol version, cipher, and certificate details when
+  available.
+- Use only on systems you own or have explicit permission to test.
