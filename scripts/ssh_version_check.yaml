@@ -1,0 +1,6 @@
+name: ssh_version_check
+port: 22
+protocol: tcp
+request: "SSH-2.0-BetaScan\r\n"
+match: "OpenSSH"
+severity: Low
