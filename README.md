@@ -38,6 +38,15 @@ Designed for penetration testers, security researchers, and network administrato
 - **Decoy Scanning (`-D`):** Mask your true IP by spoofing and interleaving scanning traffic with decoy addresses.
 - **Packet Fragmentation (`-f`):** Slices outgoing packets to confuse Deep Packet Inspection (DPI) and Intrusion Detection Systems (IDS).
 
+### Enterprise & Red Team Features (New!)
+
+* **Distributed Mass Scanning (Master-Worker):** Scale your scanning capabilities by deploying a centralized controller (`--master`) that dynamically assigns targets to multiple decentralized probing units (`--worker`).
+* **Two-Phase Host Discovery (`--phase1`):** Optimizes network bandwidth by pinging/probing active hosts first before initiating intensive scripts or full port sweeps.
+* **Host & Port Randomization (`--randomize`):** Scrambles target sequences globally across subnet layers to obfuscate traffic signatures against modern Intrusion Detection Systems (IDS).
+* **Asynchronous Proxy Swarms (`--proxy`):** Full, non-blocking SOCKS5 proxy integration via `aiohttp-socks` to mask source signatures.
+* **Scan Session Resumption (`--resume`):** Fault-tolerant state saving powered by SQLite3. Instantly resume interrupted scans without losing telemetry.
+* **Executive Reporting Engine:** Export data as industrial-grade HTML interactive dashboards (embedded with Chart.js analytics via Jinja2 templates) or stream real-time results directly via Line-Delimited JSON (`ndjson`).
+
 ## Project Structure
 
 ```text
@@ -91,6 +100,31 @@ sudo python betascan.py scanme.org -sX -f -D 8.8.8.8,1.1.1.1 --spoof-mac 00:11:2
 Run a specific application-layer vulnerability check using YAML scripts against a dedicated target:
 ```bash
 python betascan.py 172.16.5.15 --script http_git_check --format json -o results.json
+```
+
+### Advanced Enterprise Production Usage
+
+#### 1. Spinning up a Distributed Scanning Cluster
+On your core command server (Master Node):
+```bash
+sudo python3 betascan.py --master --output cluster_db.sqlite
+```
+
+On your remote perimeter deployment VPS (Worker Nodes):
+```bash
+sudo python3 betascan.py --worker --connect http://<MASTER_IP>:9999
+```
+
+#### 2. Stealth Network Sweeping with Resumption and Proxy Masking
+Scan a wide subnet routing through a SOCKS5 proxy, randomizing patterns, and caching states to ensure you can resume if the proxy drops:
+```bash
+sudo python3 betascan.py 10.0.0.0/16 --randomize --proxy socks5://127.0.0.1:9050 --phase1 --resume redteam_ops_session
+```
+
+#### 3. Generating C-Level Executive Dashboard Reports
+Execute a thorough vulnerability scan and output an interactive, graphical HTML report alongside raw NDJSON data:
+```bash
+sudo python3 betascan.py company.com --top 100 --cve --format html --output /var/www/html/report.html
 ```
 
 ## Disclaimer

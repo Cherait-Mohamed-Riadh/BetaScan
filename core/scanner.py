@@ -240,18 +240,32 @@ def classify_os_error(exc: OSError) -> str:
     if err in refused or win in refused: return "closed"
     return "filtered"
 
+_global_proxy = None
+def set_global_proxy(proxy_url: str):
+    global _global_proxy
+    _global_proxy = proxy_url
+
 async def open_tcp_connection(address: TargetAddress, port: int, timeout: float) -> Tuple[str, Optional[asyncio.StreamReader], Optional[asyncio.StreamWriter]]:
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host=address.ip, port=port, family=address.family), timeout=timeout)
+        if _global_proxy:
+            from aiohttp_socks import open_connection as socks_open_connection
+            reader, writer = await asyncio.wait_for(socks_open_connection(socks_url=_global_proxy, host=address.ip, port=port), timeout=timeout)
+        else:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host=address.ip, port=port, family=address.family), timeout=timeout)
         return "open", reader, writer
     except asyncio.TimeoutError: return "filtered", None, None
     except ConnectionRefusedError: return "closed", None, None
     except OSError as exc: return classify_os_error(exc), None, None
+    except Exception as exc: return "filtered", None, None
 
 async def tls_app_probe(address: TargetAddress, port: int, host_hint: str, timeout: float, app: str) -> Tuple[str, str]:
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host=address.ip, port=port, family=address.family, ssl=build_tls_context(), server_hostname=host_hint), timeout=timeout)
-    except (asyncio.TimeoutError, OSError, ssl.SSLError): return "", ""
+        if _global_proxy:
+            from aiohttp_socks import open_connection as socks_open_connection
+            reader, writer = await asyncio.wait_for(socks_open_connection(socks_url=_global_proxy, host=address.ip, port=port, ssl=build_tls_context(), server_hostname=host_hint), timeout=timeout)
+        else:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host=address.ip, port=port, family=address.family, ssl=build_tls_context(), server_hostname=host_hint), timeout=timeout)
+    except (asyncio.TimeoutError, OSError, ssl.SSLError, Exception): return "", ""
     tls_info = format_tls_info(writer.get_extra_info("ssl_object"))
     try:
         if app == "http": banner = await http_probe(reader, writer, host_hint, timeout)
@@ -390,10 +404,43 @@ async def scan_target(
     target: str, ports: Iterable[int], timeout: float, workers: int, retries: int, use_tls: bool, 
     fingerprint: bool, read_timeout: float, backoff: float, rate: float, open_only: bool, 
     reports_list: List[ScanReport], scan_type: str = "TCP", do_os: bool = False, do_cve: bool = False, 
-    script_name: str = None, decoy: str = None, spoof_mac: str = None, fragment: bool = False, dynamic_scripts: List[dict] = None
+    script_name: str = None, decoy: str = None, spoof_mac: str = None, fragment: bool = False, dynamic_scripts: List[dict] = None,
+    randomize: bool = False, phase1: bool = False, resume_session: str = None, proxy: str = None,
+    is_master: bool = False, is_worker: bool = False, output_format: str = None, output_file: str = None
 ) -> None:
+    if proxy:
+        set_global_proxy(proxy)
+    
     addresses = resolve_target(target)
+    if randomize:
+        import random
+        random.shuffle(addresses)
+    
     for address in addresses:
+        if phase1:
+            # Phase 1: simple ICMP/TCP ping to check if alive
+            if scan_type != "UDP": # simple check
+                try:
+                    p1_status, _, _ = await open_tcp_connection(address, 80, min(timeout, 1.0))
+                    if p1_status not in ["open", "closed", "open|filtered"]:
+                        continue # Skip this host
+                except Exception:
+                    continue
+
+        if resume_session:
+            import sqlite3
+            try:
+                conn = sqlite3.connect("session_cache.db")
+                c = conn.cursor()
+                c.execute('''CREATE TABLE IF NOT EXISTS session_state (session_name text, ip text)''')
+                c.execute('SELECT ip FROM session_state WHERE session_name=? AND ip=?', (resume_session, address.ip))
+                if c.fetchone():
+                    conn.close()
+                    continue # Already scanned
+                conn.close()
+            except Exception:
+                pass
+
         results = []
         semaphore = asyncio.Semaphore(workers)
         limiter = RateLimiter(rate) if rate > 0 else None
@@ -406,9 +453,24 @@ async def scan_target(
 
         async def bounded_scan(port: int):
             async with semaphore:
-                return await scan_port(address, port, timeout, retries, target, use_tls, fingerprint, read_timeout, backoff, limiter, scan_type, decoy, spoof_mac, fragment, do_cve, script_name, dynamic_scripts)
+                res = await scan_port(address, port, timeout, retries, target, use_tls, fingerprint, read_timeout, backoff, limiter, scan_type, decoy, spoof_mac, fragment, do_cve, script_name, dynamic_scripts)
+                if output_format == "ndjson":
+                    import json
+                    record = {"ip": address.ip, "port": res.port, "status": res.status, "service": res.service, "version": res.version, "cves": res.cves}
+                    out_line = json.dumps(record) + "\n"
+                    if output_file:
+                        with open(output_file, "a", encoding="utf-8") as f:
+                            f.write(out_line)
+                    else:
+                        print(out_line.strip())
+                return res
 
-        tasks = [asyncio.create_task(bounded_scan(p)) for p in ports]
+        port_list = list(ports)
+        if randomize:
+            import random
+            random.shuffle(port_list)
+            
+        tasks = [asyncio.create_task(bounded_scan(p)) for p in port_list]
         start_time = time.perf_counter()
         try:
             for task in asyncio.as_completed(tasks):
@@ -420,6 +482,16 @@ async def scan_target(
         if open_only: report.results = [r for r in results if r.status in ("open", "open|filtered")]
         report.duration = time.perf_counter() - start_time
         report.summary = {"open": sum(1 for r in results if r.status in ("open", "open|filtered")), "closed": sum(1 for r in results if r.status == "closed"), "filtered": sum(1 for r in results if r.status == "filtered"), "total": len(results)}
+
+        if resume_session:
+            try:
+                conn = sqlite3.connect("session_cache.db")
+                c = conn.cursor()
+                c.execute('INSERT INTO session_state (session_name, ip) VALUES (?, ?)', (resume_session, address.ip))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
 
 
 # Formatters
@@ -447,6 +519,71 @@ def report_to_dict(r: ScanReport) -> dict:
 def render_json_output(reports: Sequence[ScanReport]) -> str:
     return json.dumps([report_to_dict(r) for r in reports], indent=2, ensure_ascii=True)
 
+def render_ndjson_output(reports: Sequence[ScanReport]) -> str:
+    return "\n".join(json.dumps(report_to_dict(r)) for r in reports)
+
+def render_html_output(reports: Sequence[ScanReport]) -> str:
+    try:
+        from jinja2 import Template
+    except ImportError:
+        return "<html><body><h1>Error: jinja2 required for HTML reports. run pip install jinja2</h1></body></html>"
+    template_str = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>BetaScan Report</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f4f4f9; }
+            h1 { color: #333; }
+            .report-card { background: #fff; padding: 15px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background-color: #0056b3; color: white; }
+            tr:hover { background-color: #f1f1f1; }
+            .high { color: red; font-weight: bold; }
+        </style>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    </head>
+    <body>
+        <h1>BetaScan Target Reports</h1>
+        {% for report in reports %}
+        <div class="report-card">
+            <h2>Target: {{ report.target }} ({{ report.ip }})</h2>
+            <p><strong>OS:</strong> {{ report.os_match }} | <strong>Duration:</strong> {{ report.duration|round(2) }}s</p>
+            <div style="width: 300px; height: 300px; margin: 0 auto;">
+                <canvas id="chart-{{ loop.index }}"></canvas>
+            </div>
+            <table>
+                <tr><th>Port</th><th>Proto</th><th>Status</th><th>Service</th><th>Version</th><th>CVEs</th></tr>
+                {% for row in report.results %}
+                <tr>
+                    <td>{{ row.port }}</td><td>{{ row.protocol }}</td><td>{{ row.status }}</td>
+                    <td>{{ row.service }}</td><td>{{ row.version }}</td>
+                    <td class="{% if row.cves %}high{% endif %}">{{ row.cves|join(', ') if row.cves else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            <script>
+            var ctx = document.getElementById('chart-{{ loop.index }}').getContext('2d');
+            new Chart(ctx, {
+                type: 'pie',
+                data: {
+                    labels: ['Open', 'Closed', 'Filtered'],
+                    datasets: [{
+                        data: [{{ report.summary.get('open',0) }}, {{ report.summary.get('closed',0) }}, {{ report.summary.get('filtered',0) }}],
+                        backgroundColor: ['#28a745', '#dc3545', '#ffc107']
+                    }]
+                }
+            });
+            </script>
+        </div>
+        {% endfor %}
+    </body>
+    </html>
+    """
+    return Template(template_str).render(reports=reports)
+
 def render_csv_output(reports: Sequence[ScanReport]) -> str:
     b = io.StringIO()
     w = csv.writer(b)
@@ -459,3 +596,119 @@ def write_output(content: str, output_path: Optional[str]) -> None:
     if output_path:
         with open(output_path, "w", encoding="utf-8", newline="") as h: h.write(content)
     else: print(content)
+
+def run_master_node(target: str, ports: List[int]):
+    print(f"[Master] Initializing master node for {target} on ports {ports[:5]}...")
+    import http.server
+    import socketserver
+    import sqlite3
+    
+    addresses = resolve_target(target)
+    ips = [a.ip for a in addresses]
+    
+    try:
+        conn = sqlite3.connect("master_queue.db")
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS tasks (ip text primary key, status text)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS results (ip text, data text)''')
+        for ip in ips:
+            c.execute('INSERT OR IGNORE INTO tasks (ip, status) VALUES (?, ?)', (ip, 'pending'))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Master] Error setting up DB: {e}")
+        return
+
+    class MasterHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/get_task':
+                try:
+                    conn = sqlite3.connect("master_queue.db")
+                    c = conn.cursor()
+                    c.execute('SELECT ip FROM tasks WHERE status="pending" LIMIT 1')
+                    row = c.fetchone()
+                    if row:
+                        ip = row[0]
+                        c.execute('UPDATE tasks SET status="assigned" WHERE ip=?', (ip,))
+                        conn.commit()
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(ip.encode('utf-8'))
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        self.wfile.write(b'NONE')
+                    conn.close()
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+                
+        def do_POST(self):
+            if self.path == '/submit_result':
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                    data = self.rfile.read(length)
+                    result_json = json.loads(data.decode('utf-8'))
+                    ip = result_json.get('ip')
+                    conn = sqlite3.connect("master_queue.db")
+                    c = conn.cursor()
+                    c.execute('UPDATE tasks SET status="completed" WHERE ip=?', (ip,))
+                    c.execute('INSERT INTO results (ip, data) VALUES (?, ?)', (ip, data.decode('utf-8')))
+                    conn.commit()
+                    conn.close()
+                    self.send_response(200)
+                    self.end_headers()
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    PORT = 9999
+    with socketserver.TCPServer(("", PORT), MasterHandler) as httpd:
+        print(f"[Master] Serving on port {PORT}. Waiting for workers...")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[Master] Shutting down.")
+
+async def run_worker_node(master_url: str, ports: List[int], args):
+    print(f"[Worker] Connecting to master at {master_url}...")
+    import urllib.request
+    import urllib.error
+    
+    while True:
+        try:
+            req = urllib.request.Request(f"http://{master_url}:9999/get_task")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    ip = response.read().decode('utf-8')
+                    if ip == "NONE":
+                        print("[Worker] No more tasks. Exiting.")
+                        break
+                    
+                    print(f"[Worker] Received task: {ip}. Scanning...")
+                    reports = []
+                    await scan_target(
+                        ip, ports, args.timeout, args.workers, args.retries, args.tls, args.fingerprint, 
+                        args.read_timeout, args.backoff, args.rate, args.open_only,
+                        reports_list=reports, proxy=args.proxy
+                    )
+                    
+                    if reports:
+                        res_data = report_to_dict(reports[0])
+                        post_req = urllib.request.Request(f"http://{master_url}:9999/submit_result", data=json.dumps(res_data).encode('utf-8'), method="POST")
+                        post_req.add_header('Content-Type', 'application/json')
+                        urllib.request.urlopen(post_req, timeout=5)
+                        print(f"[Worker] Submitted results for {ip}.")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print("[Worker] No more tasks. Exiting.")
+                break
+        except Exception as e:
+            print(f"[Worker] Error: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)

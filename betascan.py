@@ -30,7 +30,7 @@ from config import TOP_PORT_PRESETS, DEFAULT_READ_TIMEOUT
 from database import init_cve_cache
 from core.scanner import (
     parse_ports, scan_target, render_table_output, render_json_output, 
-    render_csv_output, write_output, format_summary, SCAPY_AVAILABLE
+    render_csv_output, render_html_output, render_ndjson_output, write_output, format_summary, SCAPY_AVAILABLE
 )
 from core.script_engine import load_dynamic_scripts
 
@@ -86,8 +86,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--open-only", action="store_true", help="Show only open ports")
     parser.add_argument("--fingerprint", action=argparse.BooleanOptionalAction, default=True, help="Enable or disable service fingerprinting")
     parser.add_argument("--tls", action=argparse.BooleanOptionalAction, default=True, help="Enable or disable TLS probing for HTTPS ports")
-    parser.add_argument("--format", choices=["table", "json", "csv"], default="table", help="Output format")
+    parser.add_argument("--format", choices=["table", "json", "csv", "ndjson", "html"], default="table", help="Output format")
     parser.add_argument("--output", "-o", help="Write output to a file instead of stdout")
+
+    # New Arguments for Advanced Features
+    adv_group = parser.add_argument_group("Mass Scan & Resumption")
+    adv_group.add_argument("--randomize", action="store_true", help="Randomize hosts and ports")
+    adv_group.add_argument("--phase1", action="store_true", help="Two-Phase scan: ping/SYN sweep first")
+    adv_group.add_argument("--resume", help="Resume scan from session named by this string")
+    
+    proxy_group = parser.add_argument_group("Proxy & Distributed")
+    proxy_group.add_argument("--proxy", help="SOCKS5 Proxy URL (e.g. socks5://127.0.0.1:9050)")
+    proxy_group.add_argument("--master", action="store_true", help="Run as master (distributed)")
+    proxy_group.add_argument("--worker", action="store_true", help="Run as worker (distributed)")
+
     parser.set_defaults(ports="1-1024")
     
     return parser.parse_args(argv)
@@ -133,6 +145,16 @@ def main(argv: Sequence[str]) -> int:
 
     dyn_scripts = load_dynamic_scripts()
 
+    # Master/Worker Distributed Logic
+    if args.master:
+        from core.scanner import run_master_node
+        run_master_node(args.target, ports)
+        return 0
+    elif args.worker:
+        from core.scanner import run_worker_node
+        asyncio.run(run_worker_node(args.target, ports, args))
+        return 0
+
     scan_type = "TCP"
     if args.stealth_syn: scan_type = "SYN"
     elif args.udp_scan: scan_type = "UDP"
@@ -151,7 +173,9 @@ def main(argv: Sequence[str]) -> int:
                 args.target, ports, args.timeout, args.workers, args.retries, args.tls, args.fingerprint, 
                 args.read_timeout, args.backoff, args.rate, args.open_only,
                 reports_list=reports, scan_type=scan_type, do_os=args.os, do_cve=args.cve, script_name=args.script, 
-                decoy=args.decoy, spoof_mac=args.spoof_mac, fragment=args.fragment, dynamic_scripts=dyn_scripts
+                decoy=args.decoy, spoof_mac=args.spoof_mac, fragment=args.fragment, dynamic_scripts=dyn_scripts,
+                randomize=args.randomize, phase1=args.phase1, resume_session=args.resume, proxy=args.proxy,
+                is_master=args.master, is_worker=args.worker, output_format=args.format, output_file=args.output
             )
         )
     except KeyboardInterrupt:
@@ -161,7 +185,7 @@ def main(argv: Sequence[str]) -> int:
         if scan_type == "SYN":
             manage_iptables_rule("delete")
 
-    if not reports:
+    if not reports and args.format != "ndjson":
         return 0
 
     if args.format == "table":
@@ -173,8 +197,14 @@ def main(argv: Sequence[str]) -> int:
     elif args.format == "csv":
         content = render_csv_output(reports)
         write_output(content, args.output)
+    elif args.format == "html":
+        content = render_html_output(reports)
+        write_output(content, args.output)
+    elif args.format == "ndjson":
+        # NDJSON is written streamingly, but we can still summarize
+        pass
 
-    if args.format in {"json", "csv"}:
+    if args.format in {"json", "csv", "html", "ndjson"}:
         for report in reports:
             print(format_summary(report), file=sys.stderr)
 
